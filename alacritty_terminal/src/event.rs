@@ -1,10 +1,33 @@
 use std::borrow::Cow;
 use std::fmt::{self, Debug, Formatter};
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::Arc;
 
 use crate::term::ClipboardType;
 use crate::vte::ansi::Rgb;
+
+/// Shell-integration marker observed on the PTY byte stream.
+///
+/// These correspond to FinalTerm (`OSC 133`) / VS Code (`OSC 633`) sequences
+/// emitted by shell-integration scripts, plus `OSC 7` for the current working
+/// directory. They are extracted by a byte scanner in the event loop so no
+/// `vte` fork is required.
+#[derive(Clone, Debug)]
+pub enum ShellIntegrationEvent {
+    /// `OSC 133;A` — shell displayed a new prompt.
+    PromptStarted,
+    /// `OSC 133;B` / `OSC 633;B` — user started typing / prompt ended.
+    CommandStarted,
+    /// `OSC 133;C` — command string is being executed (optional).
+    CommandExecuting,
+    /// `OSC 133;D[;exit]` — command finished.
+    CommandEnded { exit_code: Option<i32> },
+    /// `OSC 133;E[;cmd]` / `OSC 633;E[;cmd]` — literal command line.
+    CurrentCommand(String),
+    /// `OSC 7;file://host/path` / `OSC 633;P;Cwd=...` — cwd changed.
+    CwdChanged(PathBuf),
+}
 
 /// Terminal event.
 ///
@@ -56,6 +79,9 @@ pub enum Event {
 
     /// Child process exited.
     ChildExit(ExitStatus),
+
+    /// Shell-integration marker (OSC 133 / 633 / 7).
+    ShellIntegration(ShellIntegrationEvent),
 }
 
 impl Debug for Event {
@@ -74,6 +100,7 @@ impl Debug for Event {
             Event::Bell => write!(f, "Bell"),
             Event::Exit => write!(f, "Exit"),
             Event::ChildExit(status) => write!(f, "ChildExit({status:?})"),
+            Event::ShellIntegration(ev) => write!(f, "ShellIntegration({ev:?})"),
         }
     }
 }

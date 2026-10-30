@@ -9,6 +9,7 @@ pub mod event_loop;
 pub mod grid;
 pub mod index;
 pub mod selection;
+pub mod shell_integration;
 pub mod sync;
 pub mod term;
 pub mod thread;

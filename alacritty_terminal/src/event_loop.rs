@@ -15,6 +15,7 @@ use log::error;
 use polling::{Event as PollingEvent, Events, PollMode, Poller};
 
 use crate::event::{self, Event, EventListener, WindowSize};
+use crate::shell_integration;
 use crate::sync::FairMutex;
 use crate::term::Term;
 use crate::{thread, tty};
@@ -148,6 +149,14 @@ where
             // Write a copy of the bytes to the ref test file.
             if let Some(writer) = &mut writer {
                 writer.write_all(&buf[..unprocessed]).unwrap();
+            }
+
+            // Extract shell-integration markers before emulation consumes them.
+            // `vte` drops unknown OSC codes, so scan the raw bytes here.
+            for shell_event in
+                shell_integration::extract(&mut state.shell_tail, &buf[..unprocessed])
+            {
+                self.event_proxy.send_event(Event::ShellIntegration(shell_event));
             }
 
             // Parse the incoming bytes.
@@ -402,6 +411,7 @@ pub struct State {
     write_list: VecDeque<Cow<'static, [u8]>>,
     writing: Option<Writing>,
     parser: ansi::Processor,
+    shell_tail: Vec<u8>,
 }
 
 impl State {
