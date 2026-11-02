@@ -7,12 +7,25 @@ use std::sync::Arc;
 use crate::term::ClipboardType;
 use crate::vte::ansi::Rgb;
 
+/// `OSC 9;4` progress state reported by the program running in the terminal.
+///
+/// The state values match the xterm progress addon / Windows Terminal:
+/// `0` remove, `1` set, `2` error, `3` indeterminate, `4` paused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressState {
+    Idle,
+    Running,
+    Error,
+    Indeterminate,
+    Paused,
+}
+
 /// Shell-integration marker observed on the PTY byte stream.
 ///
 /// These correspond to FinalTerm (`OSC 133`) / VS Code (`OSC 633`) sequences
 /// emitted by shell-integration scripts, plus `OSC 7` for the current working
-/// directory. They are extracted by a byte scanner in the event loop so no
-/// `vte` fork is required.
+/// directory and `OSC 9;4` for progress reports. They are extracted by a byte
+/// scanner in the event loop so no `vte` fork is required.
 #[derive(Clone, Debug)]
 pub enum ShellIntegrationEvent {
     /// `OSC 133;A` — shell displayed a new prompt.
@@ -27,6 +40,12 @@ pub enum ShellIntegrationEvent {
     CurrentCommand(String),
     /// `OSC 7;file://host/path` / `OSC 633;P;Cwd=...` — cwd changed.
     CwdChanged(PathBuf),
+    /// `OSC 9;4;state[;value]` — progress report. `value` is `None` when the
+    /// sequence omitted the percentage and the previous value should be kept.
+    Progress {
+        state: ProgressState,
+        value: Option<u8>,
+    },
 }
 
 /// Terminal event.

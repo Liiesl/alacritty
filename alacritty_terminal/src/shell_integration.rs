@@ -1,8 +1,8 @@
 //! Byte-level scanner for shell-integration OSC sequences.
 //!
 //! `vte`'s `osc_dispatch` only handles a fixed set of OSC codes, so `133` /
-//! `633` / `7` would otherwise be dropped. Instead of forking `vte`, the event
-//! loop runs this scanner over the raw PTY bytes and emits
+//! `633` / `7` / `9;4` would otherwise be dropped. Instead of forking `vte`,
+//! the event loop runs this scanner over the raw PTY bytes and emits
 //! [`ShellIntegrationEvent`]s.
 //!
 //! Supported sequences (terminated by BEL or `ESC \`):
@@ -16,10 +16,11 @@
 //! - `OSC 633 ; E [; cmd]` VS Code command line
 //! - `OSC 633 ; P ; Cwd=path` VS Code cwd property
 //! - `OSC 7 ; file://host/path` cwd changed
+//! - `OSC 9 ; 4 ; state [; value]` progress report (xterm / Windows Terminal)
 
 use std::path::PathBuf;
 
-use crate::event::ShellIntegrationEvent;
+use crate::event::{ProgressState, ShellIntegrationEvent};
 
 /// Max bytes retained as a partial OSC tail across reads.
 const MAX_TAIL: usize = 4096;
@@ -107,8 +108,65 @@ fn parse_osc(content: &[u8]) -> Option<Vec<ShellIntegrationEvent>> {
         b"133" => parse_133(rest),
         b"633" => parse_633(rest),
         b"7" => parse_7(rest).map(|p| vec![ShellIntegrationEvent::CwdChanged(p)]),
+        b"9" => parse_9(rest),
         _ => None,
     }
+}
+
+/// Parse `OSC 9;4;state[;value]`, the xterm progress report.
+///
+/// Only the `4` sub-code is progress; other `OSC 9` payloads (such as iTerm2
+/// notifications) are left alone. Malformed sequences are ignored.
+fn parse_9(rest: &[u8]) -> Option<Vec<ShellIntegrationEvent>> {
+    let rest = rest.strip_prefix(b"4;")?;
+
+    let mut fields = rest.split(|&byte| byte == b';');
+    let state_field = fields.next().unwrap_or(b"");
+    let value_field = fields.next();
+    // `state[;value]` is the whole payload; anything longer is malformed.
+    if fields.next().is_some() {
+        return None;
+    }
+
+    let state = match parse_decimal(state_field)? {
+        0 => ProgressState::Idle,
+        1 => ProgressState::Running,
+        2 => ProgressState::Error,
+        3 => ProgressState::Indeterminate,
+        4 => ProgressState::Paused,
+        _ => return None,
+    };
+
+    let value = match state {
+        // `0` clears the indicator and always resets the percentage.
+        ProgressState::Idle => Some(0),
+        // Indeterminate ignores any value and keeps the previous percentage.
+        ProgressState::Indeterminate => None,
+        // `1;` means 0%, while `2;` / `4;` keep the previous percentage.
+        ProgressState::Running => match value_field {
+            Some(field) if !field.is_empty() => Some(parse_decimal(field)?.min(100) as u8),
+            _ => Some(0),
+        },
+        ProgressState::Error | ProgressState::Paused => match value_field {
+            Some(field) if !field.is_empty() => Some(parse_decimal(field)?.min(100) as u8),
+            _ => None,
+        },
+    };
+
+    Some(vec![ShellIntegrationEvent::Progress { state, value }])
+}
+
+/// Strict decimal parsing, matching xterm's progress addon: an empty field is
+/// zero, and any non-digit makes the sequence invalid.
+fn parse_decimal(bytes: &[u8]) -> Option<u32> {
+    let mut value = 0u32;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.saturating_mul(10).saturating_add(u32::from(byte - b'0'));
+    }
+    Some(value)
 }
 
 fn parse_133(rest: &[u8]) -> Option<Vec<ShellIntegrationEvent>> {
@@ -280,6 +338,89 @@ mod tests {
     #[test]
     fn ignores_other_osc() {
         let evs = run(&[b"\x1b]0;title\x07\x1b]52;c;dGVzdA==\x07"]);
+        assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn parses_progress_cycle() {
+        let evs = run(&[b"\x1b]9;4;1;25\x07\x1b]9;4;1;75\x1b\\\x1b]9;4;0\x07"]);
+        assert!(matches!(
+            evs[0],
+            ShellIntegrationEvent::Progress {
+                state: ProgressState::Running,
+                value: Some(25)
+            }
+        ));
+        assert!(matches!(
+            evs[1],
+            ShellIntegrationEvent::Progress {
+                state: ProgressState::Running,
+                value: Some(75)
+            }
+        ));
+        assert!(matches!(
+            evs[2],
+            ShellIntegrationEvent::Progress {
+                state: ProgressState::Idle,
+                value: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn progress_states_without_values_keep_the_previous_percentage() {
+        let evs = run(&[b"\x1b]9;4;2;\x07\x1b]9;4;3\x07\x1b]9;4;4\x07\x1b]9;4;1\x07"]);
+        assert!(matches!(
+            evs[0],
+            ShellIntegrationEvent::Progress {
+                state: ProgressState::Error,
+                value: None
+            }
+        ));
+        assert!(matches!(
+            evs[1],
+            ShellIntegrationEvent::Progress {
+                state: ProgressState::Indeterminate,
+                value: None
+            }
+        ));
+        assert!(matches!(
+            evs[2],
+            ShellIntegrationEvent::Progress {
+                state: ProgressState::Paused,
+                value: None
+            }
+        ));
+        assert!(matches!(
+            evs[3],
+            ShellIntegrationEvent::Progress {
+                state: ProgressState::Running,
+                value: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn progress_handles_split_reads_and_clamps_values() {
+        let evs = run(&[b"\x1b]9;4;", b"1;140\x07"]);
+        assert!(matches!(
+            evs[0],
+            ShellIntegrationEvent::Progress {
+                state: ProgressState::Running,
+                value: Some(100)
+            }
+        ));
+    }
+
+    #[test]
+    fn ignores_non_progress_osc9_and_malformed_progress() {
+        let evs = run(&[
+            b"\x1b]9;notification\x07",
+            b"\x1b]9;4\x07",
+            b"\x1b]9;4;5;10\x07",
+            b"\x1b]9;4;1;1;2\x07",
+            b"\x1b]9;4;1;x\x07",
+        ]);
         assert!(evs.is_empty());
     }
 }
